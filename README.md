@@ -6,6 +6,23 @@
 
 A powerful CLI tool to connect Tuya Smart Cameras to RTSP clients through reverse-engineered Tuya browser client APIs. Stream your Tuya cameras directly to any RTSP-compatible media player or home automation system.
 
+## Container prerelease
+
+This fork includes the complete [upstream PR #5](https://github.com/seydx/tuya-ipc-terminal/pull/5)
+at commit `9088edcb74658f4d0833a6cf5e1787aad0a434f1`, including the camera category,
+HEVC/RTSP and UDP changes. The shared-home category filter is unchanged by that PR.
+
+Build from this checkout with `docker build -t tuya-ipc-terminal .`.
+The container runs as UID/GID 10001, stores pairing state in `/data/.tuya-data`,
+and retries the RTSP process while pairing is incomplete. Mount the existing
+writable `/data` volume; no session migration is needed.
+
+Pull requests and branch pushes validate Go, both image platforms and the native
+runtime without publishing. Only explicit semantic prerelease tags publish
+`ghcr.io/sanderio-ops/tuya-ipc-terminal:<tag>` plus `sha-<full-commit>` for
+linux/amd64 and linux/arm64. Publication never requires merging the PR.
+New GHCR packages require public visibility before anonymous consumer pulls.
+
 ## ✨ Features
 
 - 🔐 **Dual Authentication**: QR code scanning OR email/password login

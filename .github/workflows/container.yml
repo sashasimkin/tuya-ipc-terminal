@@ -1,0 +1,86 @@
+name: Validate and publish container
+
+on:
+  pull_request:
+  push:
+    branches: ["**"]
+    tags: ["v*-*"]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-go@v7.0.0
+        with:
+          go-version: "1.23.9"
+          cache: true
+      - name: Verify dependencies and compile
+        run: |
+          go mod verify
+          go test ./...
+          go vet ./...
+          go build -mod=readonly -o /tmp/tuya-ipc-terminal .
+          /tmp/tuya-ipc-terminal --help
+      - uses: docker/setup-qemu-action@v4.4.0
+      - uses: docker/setup-buildx-action@v4.4.1
+      - name: Build both deployment platforms without publishing
+        uses: docker/build-push-action@v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Load native image for runtime checks
+        uses: docker/build-push-action@v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: tuya-ipc-terminal:test
+          cache-from: type=gha
+      - name: Check CLI and persistent data permissions as the runtime user
+        run: |
+          docker run --rm --read-only --entrypoint /usr/local/bin/tuya-ipc-terminal tuya-ipc-terminal:test --help
+          docker run --rm --read-only --entrypoint /bin/sh tuya-ipc-terminal:test -ec 'test "$(id -u)" = 10001; test "$PWD" = /data; test -d /etc/ssl/certs'
+          docker run --rm --read-only --tmpfs /data:uid=10001,gid=10001,mode=0700 --entrypoint /usr/local/bin/tuya-ipc-terminal tuya-ipc-terminal:test auth list
+
+  publish:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Require an explicit semantic prerelease
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-[0-9A-Za-z.-]+$ ]]
+      - uses: docker/setup-qemu-action@v4.4.0
+      - uses: docker/setup-buildx-action@v4.4.1
+      - uses: docker/login-action@v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish the exact validated checkout
+        uses: docker/build-push-action@v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+            ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ github.ref_name }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
