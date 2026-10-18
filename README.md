@@ -22,6 +22,8 @@ runtime without publishing. Only explicit semantic prerelease tags publish
 `ghcr.io/sanderio-ops/tuya-ipc-terminal:<tag>` plus `sha-<full-commit>` for
 linux/amd64 and linux/arm64. Publication never requires merging the PR.
 New GHCR packages require public visibility before anonymous consumer pulls.
+Vet keeps all default checks except `composites`, because the unchanged upstream
+code uses positional struct literals across packages.
 
 ## ✨ Features
 
