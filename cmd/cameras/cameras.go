@@ -1,11 +1,13 @@
 package cameras
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"slices"
 	"strconv"
 	"time"
 
@@ -58,6 +60,7 @@ func newRefreshCmd() *cobra.Command {
 		RunE:  runRefreshCameras,
 	}
 	cmd.Flags().Bool("debug", false, "Log redacted discovery stages to stderr")
+	cmd.Flags().StringArray("include-category", nil, "Also probe this category; requires WebRTC video support (repeatable)")
 	return cmd
 }
 
@@ -118,6 +121,12 @@ func runListCameras(cmd *cobra.Command, args []string) error {
 
 func runRefreshCameras(cmd *cobra.Command, args []string) error {
 	debug, _ := cmd.Flags().GetBool("debug")
+	includeCategories, _ := cmd.Flags().GetStringArray("include-category")
+	for _, category := range includeCategories {
+		if !categoryCodePattern.MatchString(category) {
+			return errors.New("include-category must be 1-32 lowercase letters, digits or underscores")
+		}
+	}
 	diagnostics := newDiscoveryDiagnostics(debug, cmd.ErrOrStderr())
 	fmt.Println("Refreshing camera discovery...")
 
@@ -143,7 +152,7 @@ func runRefreshCameras(cmd *cobra.Command, args []string) error {
 		}
 		diagnostics.log("stage=account index=%d", i+1)
 
-		cameras, err := discoverCamerasForUser(&user, diagnostics)
+		cameras, err := discoverCamerasForUser(&user, diagnostics, includeCategories)
 		if err != nil {
 			if debug {
 				fmt.Println("  ✗ Failed to discover cameras; see redacted diagnostics")
@@ -236,7 +245,7 @@ func runCameraInfo(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func discoverCamerasForUser(user *storage.UserSession, diagnostics discoveryDiagnostics) ([]storage.CameraInfo, error) {
+func discoverCamerasForUser(user *storage.UserSession, diagnostics discoveryDiagnostics, includeCategories []string) ([]storage.CameraInfo, error) {
 	if user.SessionData == nil {
 		diagnostics.log("stage=session failure=missing")
 		return nil, errors.New("user has no valid session data")
@@ -284,7 +293,7 @@ func discoverCamerasForUser(user *storage.UserSession, diagnostics discoveryDiag
 				diagnostics.log("stage=devices source=owned count=%d", len(room.DeviceList))
 				for _, device := range room.DeviceList {
 					// Check if device is a camera (sp = smart camera, dghsxj = another camera type)
-					supported := device.Category == "sp" || device.Category == "dghsxj" || device.Category == "sp_wnq"
+					supported := knownCameraCategory(device.Category) || slices.Contains(includeCategories, device.Category)
 					duplicate := containsDevice(devices, device.DeviceId)
 					diagnostics.device("owned", device.Category, supported, duplicate)
 					if supported && !duplicate {
@@ -309,7 +318,7 @@ func discoverCamerasForUser(user *storage.UserSession, diagnostics discoveryDiag
 			diagnostics.log("stage=devices source=shared count=%d", len(sharedHome.DeviceInfoList))
 			for _, device := range sharedHome.DeviceInfoList {
 				// Check if device is a camera (sp = smart camera, dghsxj = another camera type)
-				supported := device.Category == "sp" || device.Category == "dghsxj"
+				supported := device.Category == "sp" || device.Category == "dghsxj" || slices.Contains(includeCategories, device.Category)
 				duplicate := containsDevice(devices, device.DeviceId)
 				diagnostics.device("shared", device.Category, supported, duplicate)
 				if supported && !duplicate {
@@ -334,6 +343,13 @@ func discoverCamerasForUser(user *storage.UserSession, diagnostics discoveryDiag
 			continue // Skip if we can't get WebRTC config
 		}
 		diagnostics.log("stage=webrtc result=ok")
+		var skill tuya.Skill
+		skillErr := json.Unmarshal([]byte(webrtcConfig.Result.Skill), &skill)
+		diagnostics.log("stage=webrtc supports_webrtc=%t video_profiles=%d", webrtcConfig.Result.SupportsWebrtc, len(skill.Videos))
+		if !knownCameraCategory(device.Category) && (!webrtcConfig.Result.SupportsWebrtc || skillErr != nil || len(skill.Videos) == 0) {
+			diagnostics.log("stage=webrtc decision=unsupported_capability")
+			continue
+		}
 
 		rtspPath := storageManager.GenerateRTSPPath(device.DeviceName, device.DeviceId)
 
@@ -353,6 +369,10 @@ func discoverCamerasForUser(user *storage.UserSession, diagnostics discoveryDiag
 
 	diagnostics.log("stage=summary candidates=%d cameras=%d", len(devices), len(allCameras))
 	return allCameras, nil
+}
+
+func knownCameraCategory(category string) bool {
+	return category == "sp" || category == "dghsxj" || category == "sp_wnq"
 }
 
 func createHTTPClientWithSession(session *tuya.SessionData) *http.Client {

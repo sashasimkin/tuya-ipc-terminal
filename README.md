@@ -308,6 +308,20 @@ the inherited PR #5 accepts `sp_wnq` in owned homes only, not shared homes.
 Failures are classified as `transport`, `http`, `json` or `api`; an API failure
 with HTTP 200 is not a successful discovery. Without `--debug`, output is unchanged.
 
+If debug shows an unsupported category that you want to investigate, explicitly
+include it in the owned/shared discovery probe:
+
+```bash
+./tuya-ipc-terminal cameras refresh --debug --include-category example_camera
+```
+
+Repeat `--include-category` for additional codes. Defaults remain unchanged.
+Unknown categories are saved only when configuration confirms WebRTC support
+and a valid video profile; an API success alone is insufficient. Debug reports
+these capability checks without identifiers or raw configuration. Included
+cameras use the existing registry and RTSP paths; later refreshes must include
+the same category. This is not a guarantee of successful RTSP streaming.
+
 ### 📡 RTSP Connection Issues
 
 **Problem**: Can't connect to stream
