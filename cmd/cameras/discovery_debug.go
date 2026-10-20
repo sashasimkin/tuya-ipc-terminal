@@ -46,11 +46,9 @@ func (d discoveryDiagnostics) failure(stage string, err error) {
 
 var categoryCodePattern = regexp.MustCompile(`^[a-z0-9_]{1,32}$`)
 
-func (d discoveryDiagnostics) device(source, category string, supported, duplicate bool) {
+func (d discoveryDiagnostics) device(source, category string, duplicate bool) {
 	decision := "accepted"
-	if !supported {
-		decision = "unsupported"
-	} else if duplicate {
+	if duplicate {
 		decision = "duplicate"
 	}
 	if !categoryCodePattern.MatchString(category) {
