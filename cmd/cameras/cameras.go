@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
-	"slices"
 	"strconv"
 	"time"
 
@@ -60,7 +59,8 @@ func newRefreshCmd() *cobra.Command {
 		RunE:  runRefreshCameras,
 	}
 	cmd.Flags().Bool("debug", false, "Log redacted discovery stages to stderr")
-	cmd.Flags().StringArray("include-category", nil, "Also probe this category; requires WebRTC video support (repeatable)")
+	cmd.Flags().StringArray("include-category", nil, "Deprecated: all categories are probed for WebRTC video support")
+	_ = cmd.Flags().MarkDeprecated("include-category", "all categories are now checked automatically")
 	return cmd
 }
 
@@ -152,13 +152,10 @@ func runRefreshCameras(cmd *cobra.Command, args []string) error {
 		}
 		diagnostics.log("stage=account index=%d", i+1)
 
-		cameras, err := discoverCamerasForUser(&user, diagnostics, includeCategories)
+		cameras, err := discoverCamerasForUser(&user, diagnostics)
 		if err != nil {
-			if debug {
-				fmt.Println("  ✗ Failed to discover cameras; see redacted diagnostics")
-			} else {
-				fmt.Printf("  ✗ Failed to discover cameras: %v\n", err)
-			}
+			diagnostics.log("stage=registry decision=preserved")
+			fmt.Println("  ✗ Discovery incomplete; existing cameras preserved")
 			continue
 		}
 
@@ -177,10 +174,13 @@ func runRefreshCameras(cmd *cobra.Command, args []string) error {
 		successfulUsers++
 	}
 
-	fmt.Printf("✓ Discovery complete!\n")
+	fmt.Printf("Discovery finished.\n")
 	fmt.Printf("Successfully processed %d/%d users\n", successfulUsers, len(users))
 	fmt.Printf("Total cameras discovered: %d\n", totalCameras)
 
+	if successfulUsers != len(users) {
+		return errors.New("camera refresh incomplete; failed accounts were not updated")
+	}
 	return nil
 }
 
@@ -245,7 +245,7 @@ func runCameraInfo(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func discoverCamerasForUser(user *storage.UserSession, diagnostics discoveryDiagnostics, includeCategories []string) ([]storage.CameraInfo, error) {
+func discoverCamerasForUser(user *storage.UserSession, diagnostics discoveryDiagnostics) ([]storage.CameraInfo, error) {
 	if user.SessionData == nil {
 		diagnostics.log("stage=session failure=missing")
 		return nil, errors.New("user has no valid session data")
@@ -264,16 +264,19 @@ func discoverCamerasForUser(user *storage.UserSession, diagnostics discoveryDiag
 	_, err := tuya.GetAppInfo(httpClient, user.SessionData.ServerHost)
 	if err != nil {
 		diagnostics.failure("session", err)
-		return nil, fmt.Errorf("session is invalid: %v", err)
+		return nil, errors.New("session validation failed")
 	}
 	diagnostics.log("stage=session result=ok")
 
 	var devices []tuya.Device
+	seen := make(map[string]bool)
+	incomplete := false
 
 	// Get home list
 	homes, err := tuya.GetHomeList(httpClient, user.SessionData.ServerHost)
 	if err != nil {
 		diagnostics.failure("homes", err)
+		incomplete = true
 	} else {
 		diagnostics.log("stage=homes count=%d", len(homes.Result))
 	}
@@ -284,19 +287,19 @@ func discoverCamerasForUser(user *storage.UserSession, diagnostics discoveryDiag
 			roomList, err := tuya.GetRoomList(httpClient, user.SessionData.ServerHost, strconv.Itoa(home.Gid))
 			if err != nil {
 				diagnostics.failure("rooms", err)
-				continue // Skip this home if we can't get rooms
+				incomplete = true
+				continue
 			}
 			diagnostics.log("stage=rooms count=%d", len(roomList.Result))
 
-			// Extract cameras from rooms
+			// Collect devices before checking WebRTC capabilities
 			for _, room := range roomList.Result {
 				diagnostics.log("stage=devices source=owned count=%d", len(room.DeviceList))
 				for _, device := range room.DeviceList {
-					// Check if device is a camera (sp = smart camera, dghsxj = another camera type)
-					supported := knownCameraCategory(device.Category) || slices.Contains(includeCategories, device.Category)
-					duplicate := containsDevice(devices, device.DeviceId)
-					diagnostics.device("owned", device.Category, supported, duplicate)
-					if supported && !duplicate {
+					duplicate := seen[device.DeviceId]
+					diagnostics.device("owned", device.Category, duplicate)
+					if !duplicate {
+						seen[device.DeviceId] = true
 						devices = append(devices, device)
 					}
 				}
@@ -308,29 +311,24 @@ func discoverCamerasForUser(user *storage.UserSession, diagnostics discoveryDiag
 	sharedHomes, err := tuya.GetSharedHomeList(httpClient, user.SessionData.ServerHost)
 	if err != nil {
 		diagnostics.failure("shared", err)
+		incomplete = true
 	} else {
 		diagnostics.log("stage=shared groups=%d", len(sharedHomes.Result.SecurityWebCShareInfoList))
 	}
 	if sharedHomes != nil && len(sharedHomes.Result.SecurityWebCShareInfoList) > 0 {
 
-		// Extract cameras from shared homes
+		// Collect shared devices, deduplicating against owned devices
 		for _, sharedHome := range sharedHomes.Result.SecurityWebCShareInfoList {
 			diagnostics.log("stage=devices source=shared count=%d", len(sharedHome.DeviceInfoList))
 			for _, device := range sharedHome.DeviceInfoList {
-				// Check if device is a camera (sp = smart camera, dghsxj = another camera type)
-				supported := device.Category == "sp" || device.Category == "dghsxj" || slices.Contains(includeCategories, device.Category)
-				duplicate := containsDevice(devices, device.DeviceId)
-				diagnostics.device("shared", device.Category, supported, duplicate)
-				if supported && !duplicate {
+				duplicate := seen[device.DeviceId]
+				diagnostics.device("shared", device.Category, duplicate)
+				if !duplicate {
+					seen[device.DeviceId] = true
 					devices = append(devices, device)
 				}
 			}
 		}
-	}
-
-	if len(devices) == 0 {
-		diagnostics.log("stage=summary candidates=0 cameras=0")
-		return []storage.CameraInfo{}, nil
 	}
 
 	var allCameras []storage.CameraInfo
@@ -340,13 +338,22 @@ func discoverCamerasForUser(user *storage.UserSession, diagnostics discoveryDiag
 		webrtcConfig, err := tuya.GetWebRTCConfig(httpClient, user.SessionData.ServerHost, device.DeviceId)
 		if err != nil {
 			diagnostics.failure("webrtc", err)
-			continue // Skip if we can't get WebRTC config
+			incomplete = true
+			continue
 		}
 		diagnostics.log("stage=webrtc result=ok")
+		if !webrtcConfig.Result.SupportsWebrtc {
+			diagnostics.log("stage=webrtc supports_webrtc=false decision=unsupported_capability")
+			continue
+		}
 		var skill tuya.Skill
-		skillErr := json.Unmarshal([]byte(webrtcConfig.Result.Skill), &skill)
-		diagnostics.log("stage=webrtc supports_webrtc=%t video_profiles=%d", webrtcConfig.Result.SupportsWebrtc, len(skill.Videos))
-		if !knownCameraCategory(device.Category) && (!webrtcConfig.Result.SupportsWebrtc || skillErr != nil || len(skill.Videos) == 0) {
+		if err := json.Unmarshal([]byte(webrtcConfig.Result.Skill), &skill); err != nil {
+			diagnostics.failure("skill", err)
+			incomplete = true
+			continue
+		}
+		diagnostics.log("stage=webrtc supports_webrtc=true video_profiles=%d", len(skill.Videos))
+		if !hasUsableVideo(skill) {
 			diagnostics.log("stage=webrtc decision=unsupported_capability")
 			continue
 		}
@@ -368,11 +375,24 @@ func discoverCamerasForUser(user *storage.UserSession, diagnostics discoveryDiag
 	}
 
 	diagnostics.log("stage=summary candidates=%d cameras=%d", len(devices), len(allCameras))
+	if incomplete {
+		return nil, errors.New("discovery incomplete")
+	}
 	return allCameras, nil
 }
 
-func knownCameraCategory(category string) bool {
-	return category == "sp" || category == "dghsxj" || category == "sp_wnq"
+func hasUsableVideo(skill tuya.Skill) bool {
+	if len(skill.Videos) == 0 {
+		return false
+	}
+	// The bridge selects profiles by resolution; every selectable profile must work.
+	for _, video := range skill.Videos {
+		if video.Width <= 0 || video.Height <= 0 || video.StreamType <= 0 ||
+			(video.CodecType != 2 && video.CodecType != 4) {
+			return false
+		}
+	}
+	return true
 }
 
 func createHTTPClientWithSession(session *tuya.SessionData) *http.Client {
@@ -421,13 +441,4 @@ func getUserFromKey(userKey string) (*storage.UserSession, error) {
 	}
 
 	return nil, fmt.Errorf("user not found for key: %s", userKey)
-}
-
-func containsDevice(devices []tuya.Device, deviceID string) bool {
-	for _, device := range devices {
-		if device.DeviceId == deviceID {
-			return true
-		}
-	}
-	return false
 }

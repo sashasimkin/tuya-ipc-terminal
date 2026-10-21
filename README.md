@@ -254,13 +254,14 @@ sudo systemctl start tuya-rtsp
 | Multi-client | ✅ | Multiple viewers per camera |
 | Two-way Audio | ✅ | Camera dependent |
 
-### 🎯 Supported Camera Types
+### 🎯 Camera Discovery
 
-| Category | Description | Compatibility |
-|----------|-------------|---------------|
-| `sp` | Smart cameras | ✅ Full support |
-| `dghsxj` | Additional camera type | ✅ Full support |
-| Others | Generic Tuya cameras | ⚠️ May work |
+Discovery checks owned and shared devices regardless of their Tuya category.
+Each unique device receives one WebRTC configuration request, sequentially,
+without opening a stream. Cameras require `supportsWebrtc=true` and nonempty
+video profiles with positive dimensions/stream types and H.264 or H.265 codecs.
+All profiles must be supported because the bridge selects HD/SD by resolution.
+Capability detection does not guarantee successful RTSP streaming.
 
 ## 🐛 Troubleshooting
 
@@ -300,27 +301,23 @@ sudo systemctl start tuya-rtsp
 ./tuya-ipc-terminal cameras list
 ```
 
-Debug reports HTTP status, home/room/shared-device counts, category filtering,
-deduplication, WebRTC failures and final camera counts. It omits account/device
+Debug reports HTTP status, home/room/shared-device counts, deduplication,
+WebRTC capability decisions and final camera counts. It omits account/device
 identifiers, cookies, response bodies and API error messages. Categories are
-bounded and sanitized. `--debug` does not change discovery or registry updates:
-the inherited PR #5 accepts `sp_wnq` in owned homes only, not shared homes.
+bounded and sanitized, and are diagnostic metadata rather than an allowlist.
 Failures are classified as `transport`, `http`, `json` or `api`; an API failure
-with HTTP 200 is not a successful discovery. Without `--debug`, output is unchanged.
+with HTTP 200 is not a successful discovery.
 
-If debug shows an unsupported category that you want to investigate, explicitly
-include it in the owned/shared discovery probe:
+A home, room, shared-list, configuration or skill-parsing error leaves that
+account's existing registry unchanged, even when other devices were discovered.
+This includes configuration failures for non-camera devices: undocumented API
+errors are not assumed to mean unsupported. Other accounts can still update;
+the command exits unsuccessfully if any account fails. Retry with `--debug` to
+locate the failed stage. A fully successful empty discovery removes stale
+cameras normally. Debug logging does not change these rules.
 
-```bash
-./tuya-ipc-terminal cameras refresh --debug --include-category example_camera
-```
-
-Repeat `--include-category` for additional codes. Defaults remain unchanged.
-Unknown categories are saved only when configuration confirms WebRTC support
-and a valid video profile; an API success alone is insufficient. Debug reports
-these capability checks without identifiers or raw configuration. Included
-cameras use the existing registry and RTSP paths; later refreshes must include
-the same category. This is not a guarantee of successful RTSP streaming.
+`--include-category` is accepted for compatibility but deprecated and unnecessary:
+ordinary refresh now probes every category using the same capability checks.
 
 ### 📡 RTSP Connection Issues
 
