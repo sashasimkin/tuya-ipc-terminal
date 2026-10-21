@@ -293,12 +293,20 @@ sudo systemctl start tuya-rtsp
 # 1. Verify authentication
 ./tuya-ipc-terminal auth list
 
-# 2. Force refresh
-./tuya-ipc-terminal cameras refresh
+# 2. Refresh with redacted discovery diagnostics on stderr
+./tuya-ipc-terminal cameras refresh --debug
 
 # 3. Check if cameras are online in Tuya Smart app
-./tuya-ipc-terminal cameras list --verbose
+./tuya-ipc-terminal cameras list
 ```
+
+Debug reports HTTP status, home/room/shared-device counts, category filtering,
+deduplication, WebRTC failures and final camera counts. It omits account/device
+identifiers, cookies, response bodies and API error messages. Categories are
+bounded and sanitized. `--debug` does not change discovery or registry updates:
+the inherited PR #5 accepts `sp_wnq` in owned homes only, not shared homes.
+Failures are classified as `transport`, `http`, `json` or `api`; an API failure
+with HTTP 200 is not a successful discovery. Without `--debug`, output is unchanged.
 
 ### 📡 RTSP Connection Issues
 
