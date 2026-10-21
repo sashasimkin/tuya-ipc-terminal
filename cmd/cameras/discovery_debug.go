@@ -44,7 +44,7 @@ func (d discoveryDiagnostics) failure(stage string, err error) {
 	d.log("stage=%s failure=%s", stage, kind)
 }
 
-var diagnosticCategory = regexp.MustCompile(`^[a-z0-9_]{1,32}$`)
+var categoryCodePattern = regexp.MustCompile(`^[a-z0-9_]{1,32}$`)
 
 func (d discoveryDiagnostics) device(source, category string, supported, duplicate bool) {
 	decision := "accepted"
@@ -53,7 +53,7 @@ func (d discoveryDiagnostics) device(source, category string, supported, duplica
 	} else if duplicate {
 		decision = "duplicate"
 	}
-	if !diagnosticCategory.MatchString(category) {
+	if !categoryCodePattern.MatchString(category) {
 		category = "redacted"
 	}
 	d.log("stage=filter source=%s category=%s decision=%s", source, category, decision)
