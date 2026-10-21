@@ -22,10 +22,11 @@ func (f mockTransport) RoundTrip(req *http.Request) (*http.Response, error) { re
 func TestRefreshDebug(t *testing.T) {
 	const secret = "PRIVATE-cookie-and-api-message"
 	cases := []struct {
-		name, owned, shared, failPath, failure string
-		duplicate, quiet                       bool
-		want                                   int
-		traces                                 []string
+		name, owned, shared, failPath, failure, include string
+		duplicate, quiet, supports, badSkill, wantError bool
+		videos                                          int
+		want                                            int
+		traces                                          []string
 	}{
 		{name: "empty", traces: []string{"stage=homes count=0", "stage=shared groups=0", "stage=summary candidates=0 cameras=0"}},
 		{name: "owned-sp_wnq", owned: "sp_wnq", want: 1, traces: []string{"source=owned category=sp_wnq decision=accepted", "stage=summary candidates=1 cameras=1"}},
@@ -43,6 +44,16 @@ func TestRefreshDebug(t *testing.T) {
 		{name: "transport-failure", failPath: "/api/new/common/homeList", failure: "transport", traces: []string{"stage=homes failure=transport"}},
 		{name: "unsafe-category", owned: "sp\n" + secret, traces: []string{"source=owned category=redacted decision=unsupported"}},
 		{name: "debug-is-opt-in", owned: "sp", quiet: true, want: 1},
+		{name: "custom-default-excluded", owned: "znwnsxj", traces: []string{"category=znwnsxj decision=unsupported"}},
+		{name: "custom-owned-included", owned: "znwnsxj", include: "znwnsxj", supports: true, videos: 1, want: 1, traces: []string{"category=znwnsxj decision=accepted", "supports_webrtc=true video_profiles=1", "stage=summary candidates=1 cameras=1"}},
+		{name: "custom-shared-included", shared: "znwnsxj", include: "znwnsxj", supports: true, videos: 1, want: 1, traces: []string{"source=shared category=znwnsxj decision=accepted"}},
+		{name: "custom-deduplicated", owned: "znwnsxj", shared: "znwnsxj", include: "znwnsxj", duplicate: true, supports: true, videos: 1, want: 1, traces: []string{"source=shared category=znwnsxj decision=duplicate"}},
+		{name: "included-non-camera", owned: "switch", include: "switch", traces: []string{"supports_webrtc=false video_profiles=0", "decision=unsupported_capability", "stage=summary candidates=1 cameras=0"}},
+		{name: "included-missing-video", owned: "znwnsxj", include: "znwnsxj", supports: true, traces: []string{"supports_webrtc=true video_profiles=0", "decision=unsupported_capability"}},
+		{name: "included-bad-skill", owned: "znwnsxj", include: "znwnsxj", supports: true, badSkill: true, traces: []string{"decision=unsupported_capability"}},
+		{name: "included-config-error", owned: "znwnsxj", include: "znwnsxj", failPath: "/api/jarvis/config", failure: "api", traces: []string{"stage=webrtc failure=api", "stage=summary candidates=1 cameras=0"}},
+		{name: "included-without-debug", owned: "znwnsxj", include: "znwnsxj", supports: true, videos: 1, quiet: true, want: 1},
+		{name: "invalid-include-redacted", include: "znwnsxj\n" + secret, wantError: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -106,6 +117,20 @@ func TestRefreshDebug(t *testing.T) {
 				case "/api/jarvis/config":
 					configCalls++
 					result = map[string]string{"skill": "PrivateSkill"}
+					if tc.include != "" {
+						videos := make([]map[string]int, tc.videos)
+						for i := range videos {
+							videos[i] = map[string]int{"codecType": 2, "streamType": 2}
+						}
+						skill, err := json.Marshal(map[string]interface{}{"videos": videos})
+						if err != nil {
+							t.Fatal(err)
+						}
+						if tc.badSkill {
+							skill = []byte(secret)
+						}
+						result = map[string]interface{}{"skill": string(skill), "supportsWebrtc": tc.supports}
+					}
 				default:
 					t.Fatalf("unexpected path: %s", req.URL.Path)
 				}
@@ -145,8 +170,16 @@ func TestRefreshDebug(t *testing.T) {
 			if !tc.quiet {
 				args = append(args, "--debug")
 			}
+			if tc.include != "" {
+				args = append(args, "--include-category", tc.include)
+			}
 			cmd.SetArgs(args)
-			if err := cmd.Execute(); err != nil {
+			if err := cmd.Execute(); tc.wantError {
+				if err == nil || strings.Contains(err.Error(), secret) {
+					t.Fatalf("expected redacted validation error, got %v", err)
+				}
+				return
+			} else if err != nil {
 				t.Fatal(err)
 			}
 			got, err := manager.GetAllCameras()
