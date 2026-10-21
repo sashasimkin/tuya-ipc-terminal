@@ -51,12 +51,14 @@ func newListCmd() *cobra.Command {
 }
 
 func newRefreshCmd() *cobra.Command {
-	return &cobra.Command{
+	cmd := &cobra.Command{
 		Use:   "refresh",
 		Short: "Refresh camera discovery",
 		Long:  "Rediscover cameras from all authenticated users.",
 		RunE:  runRefreshCameras,
 	}
+	cmd.Flags().Bool("debug", false, "Log redacted discovery stages to stderr")
+	return cmd
 }
 
 func newInfoCmd() *cobra.Command {
@@ -115,6 +117,8 @@ func runListCameras(cmd *cobra.Command, args []string) error {
 }
 
 func runRefreshCameras(cmd *cobra.Command, args []string) error {
+	debug, _ := cmd.Flags().GetBool("debug")
+	diagnostics := newDiscoveryDiagnostics(debug, cmd.ErrOrStderr())
 	fmt.Println("Refreshing camera discovery...")
 
 	users, err := storageManager.ListUsers()
@@ -131,17 +135,31 @@ func runRefreshCameras(cmd *cobra.Command, args []string) error {
 	totalCameras := 0
 	successfulUsers := 0
 
-	for _, user := range users {
-		fmt.Printf("Discovering cameras for %s (%s)...\n", user.Email, user.Region)
+	for i, user := range users {
+		if debug {
+			fmt.Printf("Discovering cameras for account %d...\n", i+1)
+		} else {
+			fmt.Printf("Discovering cameras for %s (%s)...\n", user.Email, user.Region)
+		}
+		diagnostics.log("stage=account index=%d", i+1)
 
-		cameras, err := discoverCamerasForUser(&user)
+		cameras, err := discoverCamerasForUser(&user, diagnostics)
 		if err != nil {
-			fmt.Printf("  ✗ Failed to discover cameras: %v\n", err)
+			if debug {
+				fmt.Println("  ✗ Failed to discover cameras; see redacted diagnostics")
+			} else {
+				fmt.Printf("  ✗ Failed to discover cameras: %v\n", err)
+			}
 			continue
 		}
 
 		if err := storageManager.UpdateCamerasForUser(user.UserKey, cameras); err != nil {
-			fmt.Printf("  ✗ Failed to save cameras: %v\n", err)
+			if debug {
+				diagnostics.log("stage=registry failure=storage")
+				fmt.Println("  ✗ Failed to save cameras")
+			} else {
+				fmt.Printf("  ✗ Failed to save cameras: %v\n", err)
+			}
 			continue
 		}
 
@@ -218,39 +236,58 @@ func runCameraInfo(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func discoverCamerasForUser(user *storage.UserSession) ([]storage.CameraInfo, error) {
+func discoverCamerasForUser(user *storage.UserSession, diagnostics discoveryDiagnostics) ([]storage.CameraInfo, error) {
 	if user.SessionData == nil {
+		diagnostics.log("stage=session failure=missing")
 		return nil, errors.New("user has no valid session data")
 	}
 
 	httpClient := createHTTPClientWithSession(user.SessionData)
 	if httpClient == nil {
+		diagnostics.log("stage=session failure=client")
 		return nil, errors.New("failed to create HTTP client")
+	}
+	if diagnostics.enabled {
+		httpClient.Transport = discoveryTransport{base: http.DefaultTransport, diagnostics: diagnostics}
 	}
 
 	// Test session validity first
 	_, err := tuya.GetAppInfo(httpClient, user.SessionData.ServerHost)
 	if err != nil {
+		diagnostics.failure("session", err)
 		return nil, fmt.Errorf("session is invalid: %v", err)
 	}
+	diagnostics.log("stage=session result=ok")
 
 	var devices []tuya.Device
 
 	// Get home list
-	homes, _ := tuya.GetHomeList(httpClient, user.SessionData.ServerHost)
+	homes, err := tuya.GetHomeList(httpClient, user.SessionData.ServerHost)
+	if err != nil {
+		diagnostics.failure("homes", err)
+	} else {
+		diagnostics.log("stage=homes count=%d", len(homes.Result))
+	}
 	if homes != nil && len(homes.Result) > 0 {
-		for _, home := range homes.Result {
+		for i, home := range homes.Result {
+			diagnostics.log("stage=rooms home_index=%d", i+1)
 			// Get room list with devices
 			roomList, err := tuya.GetRoomList(httpClient, user.SessionData.ServerHost, strconv.Itoa(home.Gid))
 			if err != nil {
+				diagnostics.failure("rooms", err)
 				continue // Skip this home if we can't get rooms
 			}
+			diagnostics.log("stage=rooms count=%d", len(roomList.Result))
 
 			// Extract cameras from rooms
 			for _, room := range roomList.Result {
+				diagnostics.log("stage=devices source=owned count=%d", len(room.DeviceList))
 				for _, device := range room.DeviceList {
 					// Check if device is a camera (sp = smart camera, dghsxj = another camera type)
-					if (device.Category == "sp" || device.Category == "dghsxj" || device.Category == "sp_wnq") && !containsDevice(devices, device.DeviceId) {
+					supported := device.Category == "sp" || device.Category == "dghsxj" || device.Category == "sp_wnq"
+					duplicate := containsDevice(devices, device.DeviceId)
+					diagnostics.device("owned", device.Category, supported, duplicate)
+					if supported && !duplicate {
 						devices = append(devices, device)
 					}
 				}
@@ -259,14 +296,23 @@ func discoverCamerasForUser(user *storage.UserSession) ([]storage.CameraInfo, er
 	}
 
 	// Get shared home list
-	sharedHomes, _ := tuya.GetSharedHomeList(httpClient, user.SessionData.ServerHost)
+	sharedHomes, err := tuya.GetSharedHomeList(httpClient, user.SessionData.ServerHost)
+	if err != nil {
+		diagnostics.failure("shared", err)
+	} else {
+		diagnostics.log("stage=shared groups=%d", len(sharedHomes.Result.SecurityWebCShareInfoList))
+	}
 	if sharedHomes != nil && len(sharedHomes.Result.SecurityWebCShareInfoList) > 0 {
 
 		// Extract cameras from shared homes
 		for _, sharedHome := range sharedHomes.Result.SecurityWebCShareInfoList {
+			diagnostics.log("stage=devices source=shared count=%d", len(sharedHome.DeviceInfoList))
 			for _, device := range sharedHome.DeviceInfoList {
 				// Check if device is a camera (sp = smart camera, dghsxj = another camera type)
-				if (device.Category == "sp" || device.Category == "dghsxj") && !containsDevice(devices, device.DeviceId) {
+				supported := device.Category == "sp" || device.Category == "dghsxj"
+				duplicate := containsDevice(devices, device.DeviceId)
+				diagnostics.device("shared", device.Category, supported, duplicate)
+				if supported && !duplicate {
 					devices = append(devices, device)
 				}
 			}
@@ -274,16 +320,20 @@ func discoverCamerasForUser(user *storage.UserSession) ([]storage.CameraInfo, er
 	}
 
 	if len(devices) == 0 {
+		diagnostics.log("stage=summary candidates=0 cameras=0")
 		return []storage.CameraInfo{}, nil
 	}
 
 	var allCameras []storage.CameraInfo
 
-	for _, device := range devices {
+	for i, device := range devices {
+		diagnostics.log("stage=webrtc candidate_index=%d", i+1)
 		webrtcConfig, err := tuya.GetWebRTCConfig(httpClient, user.SessionData.ServerHost, device.DeviceId)
 		if err != nil {
+			diagnostics.failure("webrtc", err)
 			continue // Skip if we can't get WebRTC config
 		}
+		diagnostics.log("stage=webrtc result=ok")
 
 		rtspPath := storageManager.GenerateRTSPPath(device.DeviceName, device.DeviceId)
 
@@ -301,6 +351,7 @@ func discoverCamerasForUser(user *storage.UserSession) ([]storage.CameraInfo, er
 		allCameras = append(allCameras, camera)
 	}
 
+	diagnostics.log("stage=summary candidates=%d cameras=%d", len(devices), len(allCameras))
 	return allCameras, nil
 }
 
